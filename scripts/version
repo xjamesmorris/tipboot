@@ -1,0 +1,116 @@
+#!/bin/sh
+set -eu
+
+version=${TIPBOOT_VERSION:-dev}
+revision=${TIPBOOT_REVISION:-unknown}
+
+print_version() {
+	printf 'tipboot %s (%s)\n' "$version" "$revision"
+}
+
+check_health() {
+	status=0
+
+	for executable in \
+		/usr/local/libexec/tipboot/boot-smoke \
+		/usr/local/libexec/tipboot/build-initramfs \
+		/usr/local/libexec/tipboot/build-kernel \
+		/usr/local/libexec/tipboot/run-tipboot
+	do
+		if [ ! -x "$executable" ]; then
+			printf 'missing required executable: %s\n' "$executable" >&2
+			status=1
+		fi
+	done
+
+	for payload in \
+		/usr/local/libexec/smoke-init/init.c \
+		/usr/local/libexec/smoke-init/linker.ld \
+		/usr/local/libexec/tipboot/lib/boot-newc.py \
+		/usr/local/libexec/tipboot/lib/boot-report.py
+	do
+		if [ ! -r "$payload" ]; then
+			printf 'missing required payload: %s\n' "$payload" >&2
+			status=1
+		fi
+	done
+
+	for tool in \
+		bash \
+		bats \
+		bc \
+		bison \
+		bzip2 \
+		clang \
+		cpio \
+		depmod \
+		diff \
+		dtc \
+		file \
+		find \
+		flex \
+		gcc \
+		git \
+		gzip \
+		jq \
+		ld.lld \
+		llvm-ar \
+		llvm-objcopy \
+		lz4 \
+		make \
+		openssl \
+		pahole \
+		patch \
+		perl \
+		pkg-config \
+		python3 \
+		qemu-img \
+		qemu-system-aarch64 \
+		rsync \
+		sha256sum \
+		shellcheck \
+		tar \
+		timeout \
+		unzip \
+		xz \
+		zstd
+	do
+		if ! command -v "$tool" >/dev/null 2>&1; then
+			printf 'missing required tool: %s\n' "$tool" >&2
+			status=1
+		fi
+	done
+
+	if [ "$status" -ne 0 ]; then
+		return "$status"
+	fi
+
+	printf 'tipboot %s (%s): healthy\n' "$version" "$revision"
+}
+
+usage() {
+	cat <<'EOF'
+Usage: tipboot-version [--version | --healthcheck | --help]
+
+  --version      Print the image version and revision (default).
+  --healthcheck  Verify the installed Tipboot toolchain.
+  --help         Show this help.
+EOF
+}
+
+case ${1:-"--version"} in
+	--version)
+		print_version
+		;;
+	--health|--healthcheck)
+		check_health
+		;;
+	--help|-h)
+		usage
+		;;
+	*)
+		printf 'error: unknown argument: %s\n' "$1" >&2
+		usage >&2
+		exit 64
+		;;
+esac

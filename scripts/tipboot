@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly default_image=ghcr.io/xjamesmorris/tipboot:main
+
+usage()
+{
+	cat <<'EOF'
+Usage: tipboot [options]
+
+Build an upstream arm64 kernel in a rootless Podman container and boot-smoke
+test it with QEMU.
+
+Options:
+  --commit REF        Linus tree commit or ref (default: master)
+  --patch-dir DIR     Apply lexical *.patch files with git am --3way
+  --mbox FILE         Apply one mailbox with git am --3way
+  --output DIR        Result directory; a run subdirectory is used if nonempty
+  --cache DIR         Persistent verified Git object cache
+  --work DIR          Disk-backed temporary work root
+  --jobs N            Kernel build parallelism
+  --timeout SECONDS   QEMU boot timeout (default: 180)
+  --image IMAGE       Tool image (default: ghcr.io/xjamesmorris/tipboot:main)
+  --pull POLICY       Podman pull policy: always, newer, missing, never
+  --source-url URL    Alternate Linux Git repository
+  --keep-source       Copy the complete tracked patched tree to output/source
+  -h, --help          Show this help
+
+The current x86_64 hosts use QEMU TCG for an arm64 guest. KVM is passed
+through only on an arm64 host with a readable and writable /dev/kvm.
+EOF
+}
+
+die()
+{
+	printf 'tipboot: %s\n' "$*" >&2
+	exit 2
+}
+
+commit=master
+patch_dir=
+mbox=
+output=
+cache=${XDG_CACHE_HOME:-"$HOME/.cache"}/tipboot
+work_root=
+jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')
+timeout_seconds=180
+image=$default_image
+pull=missing
+source_url=https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+keep_source=0
+
+while (($#)); do
+	case "$1" in
+	--commit)
+		(($# >= 2)) || die "--commit requires a value"
+		commit=$2
+		shift 2
+		;;
+	--patch-dir)
+		(($# >= 2)) || die "--patch-dir requires a directory"
+		patch_dir=$2
+		shift 2
+		;;
+	--mbox)
+		(($# >= 2)) || die "--mbox requires a file"
+		mbox=$2
+		shift 2
+		;;
+	--output)
+		(($# >= 2)) || die "--output requires a directory"
+		output=$2
+		shift 2
+		;;
+	--cache)
+		(($# >= 2)) || die "--cache requires a directory"
+		cache=$2
+		shift 2
+		;;
+	--work)
+		(($# >= 2)) || die "--work requires a directory"
+		work_root=$2
+		shift 2
+		;;
+	--jobs)
+		(($# >= 2)) || die "--jobs requires a value"
+		jobs=$2
+		shift 2
+		;;
+	--timeout)
+		(($# >= 2)) || die "--timeout requires a value"
+		timeout_seconds=$2
+		shift 2
+		;;
+	--image)
+		(($# >= 2)) || die "--image requires a value"
+		image=$2
+		shift 2
+		;;
+	--pull)
+		(($# >= 2)) || die "--pull requires a value"
+		pull=$2
+		shift 2
+		;;
+	--source-url)
+		(($# >= 2)) || die "--source-url requires a value"
+		source_url=$2
+		shift 2
+		;;
+	--keep-source)
+		keep_source=1
+		shift
+		;;
+	-h|--help)
+		usage
+		exit 0
+		;;
+	*)
+		die "unknown option: $1"
+		;;
+	esac
+done
+
+case "$jobs" in
+	''|*[!0-9]*) die "--jobs must be a positive integer" ;;
+esac
+((jobs > 0 && jobs <= 65536)) ||
+	die "--jobs must be an integer from 1 through 65536"
+case "$timeout_seconds" in
+	''|*[!0-9]*) die "--timeout must be a positive integer" ;;
+esac
+((timeout_seconds > 0 && timeout_seconds <= 3600)) ||
+	die "--timeout must be an integer from 1 through 3600"
+case "$pull" in
+	always|newer|missing|never) ;;
+	*) die "invalid --pull policy: $pull" ;;
+esac
+
+if [[ -n $patch_dir ]]; then
+	patch_dir=$(realpath "$patch_dir")
+	[[ -d $patch_dir ]] || die "patch directory does not exist: $patch_dir"
+fi
+if [[ -n $mbox ]]; then
+	mbox=$(realpath "$mbox")
+	[[ -f $mbox ]] || die "mbox does not exist: $mbox"
+fi
+
+if [[ -z $work_root ]]; then
+	work_root=${cache%/}-work
+fi
+if [[ -z $output ]]; then
+	printf -v run_stamp '%(%Y%m%d-%H%M%S)T' -1
+	output=$PWD/out/$run_stamp
+fi
+if [[ -d $output && -n $(find "$output" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+	printf -v run_stamp '%(%Y%m%d-%H%M%S)T' -1
+	output=${output%/}/$run_stamp-$$
+fi
+mkdir -p "$output" "$cache" "$work_root"
+output=$(realpath "$output")
+cache=$(realpath "$cache")
+work_root=$(realpath "$work_root")
+[[ $output != / ]] || die "refusing output directory /"
+[[ $cache != / ]] || die "refusing cache directory /"
+[[ $work_root != / ]] || die "refusing work directory /"
+
+command -v podman >/dev/null || die "podman is required"
+rootless=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null) ||
+	die "cannot query Podman rootless status"
+[[ $rootless == true ]] ||
+	die "Tipboot requires rootless Podman"
+
+paths_overlap()
+{
+	local first=${1%/}/
+	local second=${2%/}/
+	[[ $first == "$second" || $first == "$second"* || $second == "$first"* ]]
+}
+
+if paths_overlap "$output" "$cache" ||
+	paths_overlap "$output" "$work_root" ||
+	paths_overlap "$cache" "$work_root"; then
+	die "output, cache, and work directories must not overlap"
+fi
+
+base_container_args=(
+	run
+	--rm
+	--read-only
+	--userns=keep-id
+	--user="$(id -u):$(id -g)"
+	--security-opt=no-new-privileges
+	--cap-drop=all
+	--pids-limit=4096
+	'--tmpfs=/tmp:rw,nosuid,nodev,size=1g'
+	'--tmpfs=/run:rw,nosuid,nodev,size=16m'
+)
+
+resolution_dir=$(mktemp -d "$work_root/tipboot-resolution.XXXXXXXX")
+cleanup()
+{
+	rm -rf -- "$resolution_dir"
+}
+trap cleanup EXIT
+
+podman "${base_container_args[@]}" \
+	--pull="$pull" \
+	--volume="$cache:/cache:Z" \
+	--volume="$resolution_dir:/resolve:Z" \
+	"$image" \
+	/usr/local/libexec/tipboot/build-kernel \
+		--source-url "$source_url" \
+		--commit "$commit" \
+		--work /resolve/work \
+		--output /resolve/output \
+		--cache /cache \
+		--resolve-only
+
+resolved_commit=$(<"$resolution_dir/output/resolved-commit")
+case "$resolved_commit" in
+	*[!0-9a-f]*|'') die "resolver returned an invalid commit" ;;
+esac
+case "${#resolved_commit}" in
+	40|64) ;;
+	*) die "resolver returned an invalid commit length" ;;
+esac
+image_id=$(podman image inspect --format '{{.Id}}' "$image") ||
+	die "cannot inspect tool image ID"
+image_digest=$(podman image inspect --format '{{.Digest}}' "$image") ||
+	die "cannot inspect tool image digest"
+
+container_args=(
+	"${base_container_args[@]}"
+	--pull=never
+	--network=none
+	--volume="$output:/output:Z"
+	--volume="$cache:/cache:ro,Z"
+	--volume="$work_root:/work:Z"
+	--env=TIPBOOT_IMAGE_REF="$image"
+	--env=TIPBOOT_IMAGE_ID="$image_id"
+	--env=TIPBOOT_IMAGE_DIGEST="$image_digest"
+)
+
+runner_args=(
+	--source-url "$source_url"
+	--commit "$resolved_commit"
+	--output /output
+	--cache /cache
+	--work-root /work
+	--offline-source
+	--jobs "$jobs"
+	--timeout "$timeout_seconds"
+)
+
+if [[ -n $patch_dir ]]; then
+	container_args+=(--volume="$patch_dir:/input/patches:ro,z")
+	runner_args+=(--patch-dir /input/patches)
+fi
+if [[ -n $mbox ]]; then
+	container_args+=(--volume="$mbox:/input/series.mbox:ro,z")
+	runner_args+=(--mbox /input/series.mbox)
+fi
+if ((keep_source)); then
+	runner_args+=(--keep-source)
+fi
+
+if [[ $(uname -m) == aarch64 && -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
+	container_args+=(--device=/dev/kvm)
+fi
+
+podman "${container_args[@]}" "$image" \
+	/usr/local/libexec/tipboot/run-tipboot "${runner_args[@]}"

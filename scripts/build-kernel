@@ -1,0 +1,1027 @@
+#!/usr/bin/env bash
+set -eEuo pipefail
+
+readonly program=${0##*/}
+readonly default_source_url=https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+readonly default_revision=master
+
+usage()
+{
+	cat <<'EOF'
+Usage: build-kernel [options]
+
+Resolve, patch, and build one isolated arm64 Linux source checkout. Work,
+output, and cache directories must be distinct. Work and output must be empty;
+cache is persistent and may be reused across runs.
+
+Options:
+  --source-url URL    Linux Git source
+  --commit REV        Branch, tag, full ref, or exact 40/64-digit commit
+  --patch-dir DIR     Apply top-level *.patch files in C lexical order
+  --mbox FILE         Apply one mailbox after the patch directory
+  --work DIR          Empty scratch directory for checkout and build
+  --output DIR        Empty durable artifact directory
+  --cache DIR         Persistent bare Git object-cache directory
+  --jobs N            Image build parallelism (default: online CPUs)
+  --keep-source       Copy the final tracked source tree to OUTPUT/source
+  --resolve-only      Resolve/fetch source and write OUTPUT/resolved-commit
+  --offline           Use an already populated read-only cache; requires SHA
+  -h, --help          Show this help
+
+Environment equivalents:
+  TIPBOOT_KERNEL_SOURCE_URL
+  TIPBOOT_KERNEL_COMMIT
+  TIPBOOT_KERNEL_PATCH_DIR
+  TIPBOOT_KERNEL_MBOX
+  TIPBOOT_KERNEL_WORK
+  TIPBOOT_KERNEL_OUTPUT
+  TIPBOOT_KERNEL_CACHE
+  TIPBOOT_KERNEL_JOBS
+  TIPBOOT_KERNEL_KEEP_SOURCE=0|1
+
+Defaults:
+  source URL          https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+  commit/ref          master
+
+Patch handling:
+  Patch files are snapshotted and SHA-256 hashed before use. Top-level
+  *.patch files are applied in C lexical order, followed by the optional
+  mailbox. Every input is applied with "git am --3way". Processing stops at
+  the first failure without aborting the in-progress git am state.
+
+Output:
+  .config             Exact generated kernel configuration
+  config              Compatibility copy of .config
+  kernelrelease       Result of make kernelrelease
+  Image               arch/arm64/boot/Image
+  build.log           Source, patch, configure, and build transcript
+  patches.sha256      Hash manifest in application order
+  source.json         Machine-readable source and patched object provenance
+  source.txt          Human-readable source and patched object provenance
+
+On failure, build.log, source metadata, partial configuration, Git status,
+and the current patch/diffs are retained in OUTPUT where available. WORK is
+never removed by this script.
+
+Exit status:
+  0  success
+  2  invalid arguments or input
+  3  tool, directory, or logging setup failure
+  4  source cache, resolution, or checkout failure
+  5  patch application failure
+  6  configure or build failure
+  7  artifact or provenance capture failure
+EOF
+}
+
+usage_error()
+{
+	printf '%s: %s\n' "$program" "$*" >&2
+	printf "Try '%s --help' for usage.\n" "$program" >&2
+	exit 2
+}
+
+require_value()
+{
+	local option=$1
+	local count=$2
+
+	((count >= 2)) || usage_error "$option requires a value"
+}
+
+parse_boolean()
+{
+	case "$1" in
+	1|true|TRUE|yes|YES|on|ON)
+		printf '1\n'
+		;;
+	0|false|FALSE|no|NO|off|OFF|'')
+		printf '0\n'
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+source_url=${TIPBOOT_KERNEL_SOURCE_URL:-$default_source_url}
+revision=${TIPBOOT_KERNEL_COMMIT:-$default_revision}
+patch_dir=${TIPBOOT_KERNEL_PATCH_DIR:-}
+mbox=${TIPBOOT_KERNEL_MBOX:-}
+work_dir=${TIPBOOT_KERNEL_WORK:-}
+output_dir=${TIPBOOT_KERNEL_OUTPUT:-}
+cache_dir=${TIPBOOT_KERNEL_CACHE:-}
+jobs=${TIPBOOT_KERNEL_JOBS:-}
+keep_source_raw=${TIPBOOT_KERNEL_KEEP_SOURCE:-0}
+resolve_only=0
+offline=0
+
+if ! keep_source=$(parse_boolean "$keep_source_raw"); then
+	usage_error "TIPBOOT_KERNEL_KEEP_SOURCE must be a boolean"
+fi
+
+while (($#)); do
+	case "$1" in
+	--source-url)
+		require_value "$1" "$#"
+		source_url=$2
+		shift 2
+		;;
+	--commit)
+		require_value "$1" "$#"
+		revision=$2
+		shift 2
+		;;
+	--patch-dir)
+		require_value "$1" "$#"
+		patch_dir=$2
+		shift 2
+		;;
+	--mbox)
+		require_value "$1" "$#"
+		mbox=$2
+		shift 2
+		;;
+	--work|--work-dir)
+		require_value "$1" "$#"
+		work_dir=$2
+		shift 2
+		;;
+	--output|--output-dir)
+		require_value "$1" "$#"
+		output_dir=$2
+		shift 2
+		;;
+	--cache|--cache-dir)
+		require_value "$1" "$#"
+		cache_dir=$2
+		shift 2
+		;;
+	--jobs)
+		require_value "$1" "$#"
+		jobs=$2
+		shift 2
+		;;
+	--keep-source)
+		keep_source=1
+		shift
+		;;
+	--resolve-only)
+		resolve_only=1
+		shift
+		;;
+	--offline)
+		offline=1
+		shift
+		;;
+	-h|--help)
+		usage
+		exit 0
+		;;
+	--)
+		shift
+		(($# == 0)) || usage_error "positional arguments are not supported"
+		;;
+	*)
+		usage_error "unknown option: $1"
+		;;
+	esac
+done
+
+[[ -n $source_url ]] || usage_error "--source-url must not be empty"
+[[ -n $revision ]] || usage_error "--commit must not be empty"
+[[ -n $work_dir ]] || usage_error "--work is required"
+[[ -n $output_dir ]] || usage_error "--output is required"
+[[ -n $cache_dir ]] || usage_error "--cache is required"
+if ((offline)) && [[ ! $revision =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]; then
+	usage_error "--offline requires an exact 40- or 64-digit commit"
+fi
+if ((offline && resolve_only)); then
+	usage_error "--offline and --resolve-only are mutually exclusive"
+fi
+
+case "$source_url$revision" in
+*$'\n'*|*$'\r'*)
+	usage_error "source URL and commit/ref must not contain newlines"
+	;;
+esac
+
+find_executable()
+{
+	type -P -- "$1"
+}
+
+if [[ -z $jobs ]]; then
+	if nproc_bin=$(find_executable nproc 2>/dev/null); then
+		jobs=$("$nproc_bin")
+	else
+		jobs=1
+	fi
+fi
+
+if [[ ! $jobs =~ ^[1-9][0-9]{0,4}$ ]] || ((10#$jobs > 65536)); then
+	usage_error "--jobs must be an integer from 1 through 65536"
+fi
+
+declare git_bin make_bin sha256_bin jq_bin realpath_bin find_bin
+declare flock_bin tee_bin cp_bin mv_bin mkdir_bin
+
+for required_tool in git make sha256sum jq realpath find flock tee cp mv mkdir; do
+	if ! required_path=$(find_executable "$required_tool" 2>/dev/null); then
+		printf '%s: required tool not found: %s\n' "$program" "$required_tool" >&2
+		exit 3
+	fi
+	case "$required_tool" in
+	git) git_bin=$required_path ;;
+	make) make_bin=$required_path ;;
+	sha256sum) sha256_bin=$required_path ;;
+	jq) jq_bin=$required_path ;;
+	realpath) realpath_bin=$required_path ;;
+	find) find_bin=$required_path ;;
+	flock) flock_bin=$required_path ;;
+	tee) tee_bin=$required_path ;;
+	cp) cp_bin=$required_path ;;
+	mv) mv_bin=$required_path ;;
+	mkdir) mkdir_bin=$required_path ;;
+	esac
+done
+
+if ! git_version=$("$git_bin" --version); then
+	printf '%s: cannot query Git version\n' "$program" >&2
+	exit 3
+fi
+if ! make_version=$("$make_bin" --version); then
+	printf '%s: cannot query make version\n' "$program" >&2
+	exit 3
+fi
+make_version=${make_version%%$'\n'*}
+
+while IFS= read -r environment_name; do
+	case "$environment_name" in
+	GIT_*)
+		unset "$environment_name"
+		;;
+	esac
+done < <(compgen -e)
+
+unset SSH_ASKPASS MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKEFILES
+unset ARCH SUBARCH SRCARCH CROSS_COMPILE LLVM LLVM_IAS KBUILD_OUTPUT
+unset KCONFIG_CONFIG KBUILD_EXTMOD CC CXX LD AR NM STRIP OBJCOPY OBJDUMP
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_ATTR_NOSYSTEM=1
+export GIT_TERMINAL_PROMPT=0
+export GIT_ASKPASS=/bin/false
+export SSH_ASKPASS=/bin/false
+export GIT_NO_REPLACE_OBJECTS=1
+export GIT_PAGER=cat
+export LC_ALL=C
+umask 022
+
+git_safe()
+{
+	"$git_bin" \
+		-c core.hooksPath=/dev/null \
+		-c core.fsmonitor=false \
+		-c core.untrackedCache=false \
+		-c init.defaultBranch=tipboot \
+		-c gc.auto=0 \
+		-c maintenance.auto=false \
+		-c protocol.allow=never \
+		-c protocol.file.allow=always \
+		-c protocol.http.allow=always \
+		-c protocol.https.allow=always \
+		-c protocol.git.allow=always \
+		-c protocol.ssh.allow=always \
+		-c protocol.ext.allow=never \
+		"$@"
+}
+
+make_directory()
+{
+	local path=$1
+
+	if ! "$mkdir_bin" -p -- "$path"; then
+		printf '%s: cannot create directory: %s\n' "$program" "$path" >&2
+		exit 3
+	fi
+}
+
+make_directory "$work_dir"
+make_directory "$output_dir"
+make_directory "$cache_dir"
+
+if ! work_dir=$("$realpath_bin" -e -- "$work_dir"); then
+	printf '%s: cannot resolve work directory\n' "$program" >&2
+	exit 3
+fi
+if ! output_dir=$("$realpath_bin" -e -- "$output_dir"); then
+	printf '%s: cannot resolve output directory\n' "$program" >&2
+	exit 3
+fi
+if ! cache_dir=$("$realpath_bin" -e -- "$cache_dir"); then
+	printf '%s: cannot resolve cache directory\n' "$program" >&2
+	exit 3
+fi
+
+for path in "$work_dir" "$output_dir" "$cache_dir"; do
+	[[ $path != / ]] || usage_error "work, output, and cache must not be /"
+	case "$path" in
+	*$'\n'*|*$'\r'*)
+		usage_error "work, output, and cache paths must not contain newlines"
+		;;
+	esac
+done
+
+paths_overlap()
+{
+	local first=$1
+	local second=$2
+
+	[[ $first == "$second" || $first == "$second/"* || $second == "$first/"* ]]
+}
+
+if paths_overlap "$work_dir" "$output_dir" ||
+	paths_overlap "$work_dir" "$cache_dir" ||
+	paths_overlap "$output_dir" "$cache_dir"; then
+	usage_error "work, output, and cache directories must not overlap"
+fi
+
+directory_is_empty()
+{
+	local path=$1
+	local first_entry
+
+	if ! first_entry=$("$find_bin" "$path" -mindepth 1 -maxdepth 1 -print -quit); then
+		return 1
+	fi
+	[[ -z $first_entry ]]
+}
+
+directory_is_empty "$work_dir" ||
+	usage_error "work directory must be empty: $work_dir"
+directory_is_empty "$output_dir" ||
+	usage_error "output directory must be empty: $output_dir"
+
+if [[ -n $patch_dir ]]; then
+	if ! patch_dir=$("$realpath_bin" -e -- "$patch_dir"); then
+		usage_error "patch directory does not exist: $patch_dir"
+	fi
+	[[ -d $patch_dir && -r $patch_dir ]] ||
+		usage_error "patch directory is not readable: $patch_dir"
+	case "$patch_dir" in
+	*$'\n'*|*$'\r'*)
+		usage_error "patch directory path must not contain newlines"
+		;;
+	esac
+fi
+
+if [[ -n $mbox ]]; then
+	if ! mbox=$("$realpath_bin" -e -- "$mbox"); then
+		usage_error "mbox does not exist: $mbox"
+	fi
+	[[ -f $mbox && -r $mbox ]] ||
+		usage_error "mbox is not a readable regular file: $mbox"
+	case "$mbox" in
+	*$'\n'*|*$'\r'*)
+		usage_error "mbox path must not contain newlines"
+		;;
+	esac
+fi
+
+readonly source_dir=$work_dir/source
+readonly build_dir=$work_dir/build
+readonly patch_snapshot_dir=$work_dir/patch-inputs
+readonly empty_template_dir=$work_dir/empty-git-template
+readonly patch_jsonl=$work_dir/patches.jsonl
+readonly build_log=$output_dir/build.log
+readonly patch_manifest=$output_dir/patches.sha256
+
+make_directory "$source_dir"
+make_directory "$build_dir"
+make_directory "$patch_snapshot_dir"
+make_directory "$empty_template_dir"
+if ! : > "$patch_jsonl"; then
+	printf '%s: cannot initialize patch provenance: %s\n' \
+		"$program" "$patch_jsonl" >&2
+	exit 3
+fi
+if ! : > "$build_log"; then
+	printf '%s: cannot initialize build log: %s\n' \
+		"$program" "$build_log" >&2
+	exit 3
+fi
+if ! : > "$patch_manifest"; then
+	printf '%s: cannot initialize patch manifest: %s\n' \
+		"$program" "$patch_manifest" >&2
+	exit 3
+fi
+
+current_stage=setup
+failure_message=
+source_url_hash=
+source_object_format=
+resolved_ref=
+source_commit=
+patched_head=
+patched_tree=
+kernel_release=
+patch_count=0
+outcome=running
+diagnostics_ready=1
+run_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+redact_source_url()
+{
+	local value=$1
+	local scheme rest
+
+	if [[ $value == *://* && ${value#*://} == *@* ]]; then
+		scheme=${value%%://*}
+		rest=${value#*://}
+		printf '%s://<redacted>@%s\n' "$scheme" "${rest#*@}"
+	else
+		printf '%s\n' "$value"
+	fi
+}
+
+display_source_url=$(redact_source_url "$source_url")
+
+log()
+{
+	local message=$*
+
+	printf '%s: %s\n' "$program" "$message" >&2
+	if ((diagnostics_ready)); then
+		if ! printf '%s: %s\n' "$program" "$message" >> "$build_log"; then
+			printf '%s: warning: cannot append to %s\n' \
+				"$program" "$build_log" >&2
+		fi
+	fi
+}
+
+die()
+{
+	local status=$1
+	shift
+
+	failure_message=$*
+	log "ERROR: $failure_message"
+	exit "$status"
+}
+
+run_logged()
+{
+	local -a pipeline_status
+
+	"$@" 2>&1 | "$tee_bin" -a "$build_log"
+	pipeline_status=("${PIPESTATUS[@]}")
+	if ((pipeline_status[1] != 0)); then
+		printf '%s: logging failed with status %d\n' \
+			"$program" "${pipeline_status[1]}" >&2
+		return "${pipeline_status[1]}"
+	fi
+	return "${pipeline_status[0]}"
+}
+
+run_capture_stderr_logged()
+{
+	local capture_file=$1
+	local stderr_file=$2
+	local command_status
+	shift 2
+
+	"$@" > "$capture_file" 2> "$stderr_file"
+	command_status=$?
+	if [[ -s $stderr_file ]]; then
+		if ! "$tee_bin" -a "$build_log" < "$stderr_file" >&2; then
+			return 3
+		fi
+	fi
+	return "$command_status"
+}
+
+write_source_metadata()
+{
+	local metadata_state=$1
+	local metadata_tmp=$output_dir/.source.json.tmp
+	local text_tmp=$output_dir/.source.txt.tmp
+
+	# jq variables below are jq arguments, not shell expansions.
+	# shellcheck disable=SC2016
+	if ! "$jq_bin" -n \
+		--arg state "$metadata_state" \
+		--arg stage "$current_stage" \
+		--arg error "$failure_message" \
+		--arg source_url "$display_source_url" \
+		--arg source_url_sha256 "$source_url_hash" \
+		--arg object_format "$source_object_format" \
+		--arg requested_revision "$revision" \
+		--arg resolved_ref "$resolved_ref" \
+		--arg commit "$source_commit" \
+		--arg patched_head "$patched_head" \
+		--arg tree "$patched_tree" \
+		--arg kernelrelease "$kernel_release" \
+		--arg run_utc "$run_utc" \
+		--arg bash_version "$BASH_VERSION" \
+		--arg git_version "$git_version" \
+		--arg make_version "$make_version" \
+		--argjson jobs "$jobs" \
+		--slurpfile patches "$patch_jsonl" \
+		'
+		def optional: if . == "" then null else . end;
+		{
+			format_version: 1,
+			state: $state,
+			stage: $stage,
+			error: ($error | optional),
+			source_url: $source_url,
+			source_url_sha256: ($source_url_sha256 | optional),
+			object_format: ($object_format | optional),
+			requested_revision: $requested_revision,
+			resolved_ref: ($resolved_ref | optional),
+			commit: ($commit | optional),
+			patched_head: ($patched_head | optional),
+			tree: ($tree | optional),
+			patches: $patches,
+			build: {
+				arch: "arm64",
+				llvm: true,
+				defconfig: "defconfig",
+				target: "Image",
+				jobs: $jobs,
+				kernelrelease: ($kernelrelease | optional)
+			},
+			tools: {
+				bash: $bash_version,
+				git: $git_version,
+				make: $make_version
+			},
+			run_utc: $run_utc
+		}
+		' > "$metadata_tmp"; then
+		return 1
+	fi
+	if ! "$mv_bin" -f -- "$metadata_tmp" "$output_dir/source.json"; then
+		return 1
+	fi
+
+	{
+		printf 'state: %s\n' "$metadata_state"
+		printf 'stage: %s\n' "$current_stage"
+		printf 'source URL: %s\n' "$display_source_url"
+		printf 'source URL SHA-256: %s\n' "${source_url_hash:-unavailable}"
+		printf 'object format: %s\n' "${source_object_format:-unavailable}"
+		printf 'requested revision: %s\n' "$revision"
+		printf 'resolved ref: %s\n' "${resolved_ref:-exact commit}"
+		printf 'source commit: %s\n' "${source_commit:-unavailable}"
+		printf 'patched HEAD: %s\n' "${patched_head:-unavailable}"
+		printf 'patched tree: %s\n' "${patched_tree:-unavailable}"
+		printf 'patch inputs: %d\n' "$patch_count"
+		printf 'kernel release: %s\n' "${kernel_release:-unavailable}"
+		printf 'Bash: %s\n' "$BASH_VERSION"
+		printf 'Git: %s\n' "$git_version"
+		printf 'make: %s\n' "$make_version"
+		printf 'run UTC: %s\n' "$run_utc"
+		if [[ -n $failure_message ]]; then
+			printf 'error: %s\n' "$failure_message"
+		fi
+	} > "$text_tmp" || return 1
+	"$mv_bin" -f -- "$text_tmp" "$output_dir/source.txt"
+}
+
+capture_partial_config()
+{
+	if [[ -s $build_dir/.config ]]; then
+		"$cp_bin" -f -- "$build_dir/.config" "$output_dir/.config" || return 1
+		"$cp_bin" -f -- "$build_dir/.config" "$output_dir/config" || return 1
+	fi
+}
+
+capture_source_diagnostics()
+{
+	local current_patch_tmp=$work_dir/current-patch.tmp
+
+	[[ -d $source_dir/.git ]] || return 0
+	{
+		printf 'Stage: %s\n' "$current_stage"
+		printf 'Work directory: %s\n\n' "$work_dir"
+		printf '%s\n' 'Git status:'
+		git_safe -C "$source_dir" status --porcelain=v2 --branch
+		printf '\n%s\n' 'Recent commits:'
+		git_safe -C "$source_dir" log -n 20 --date=iso-strict \
+			--format='%H%n  tree %T%n  author %an <%ae>%n  date %aI%n  %s'
+	} > "$output_dir/source-diagnostics.txt" 2>&1 || :
+
+	git_safe -C "$source_dir" diff --binary --no-ext-diff --no-textconv -- \
+		> "$output_dir/source-worktree.diff" 2>> "$build_log" || :
+	git_safe -C "$source_dir" diff --cached --binary --no-ext-diff \
+		--no-textconv -- > "$output_dir/source-index.diff" \
+		2>> "$build_log" || :
+	if git_safe -C "$source_dir" am --show-current-patch=raw \
+		> "$current_patch_tmp" 2>> "$build_log" &&
+		[[ -s $current_patch_tmp ]]; then
+		"$mv_bin" -f -- "$current_patch_tmp" \
+			"$output_dir/failed-patch.mbox" || :
+	fi
+}
+
+on_exit()
+{
+	local status=$?
+
+	trap - EXIT
+	if ((status != 0)) && ((diagnostics_ready)); then
+		set +e
+		outcome=failed
+		capture_partial_config
+		capture_source_diagnostics
+		write_source_metadata "$outcome"
+		{
+			printf 'status=failed\n'
+			printf 'exit_code=%d\n' "$status"
+			printf 'stage=%s\n' "$current_stage"
+			printf 'work_directory=%s\n' "$work_dir"
+		} > "$output_dir/FAILED"
+		log "failure retained in $output_dir (work: $work_dir, exit: $status)"
+	fi
+	exit "$status"
+}
+trap on_exit EXIT
+
+snapshot_patch()
+{
+	local input_kind=$1
+	local input_path=$2
+	local input_name=$3
+	local snapshot_name=$4
+	local manifest_name=$5
+	local snapshot_path=$patch_snapshot_dir/$snapshot_name
+	local hash_line hash
+
+	case "$input_name" in
+	*$'\n'*|*$'\r'*|*$'\t'*)
+		die 2 "patch input names must not contain tabs or newlines: $input_name"
+		;;
+	esac
+
+	if ! "$cp_bin" -- "$input_path" "$snapshot_path"; then
+		die 3 "cannot snapshot patch input: $input_path"
+	fi
+	if ! hash_line=$("$sha256_bin" -- "$snapshot_path"); then
+		die 3 "cannot hash patch input: $input_path"
+	fi
+	hash=${hash_line%% *}
+	[[ $hash =~ ^[0-9a-f]{64}$ ]] ||
+		die 3 "unexpected SHA-256 output for: $input_path"
+
+	if ! printf '%s  %s\n' "$hash" "$manifest_name" >> "$patch_manifest"; then
+		die 3 "cannot write patch hash manifest"
+	fi
+	((patch_count += 1))
+	# jq variables below are jq arguments, not shell expansions.
+	# shellcheck disable=SC2016
+	if ! "$jq_bin" -cn \
+		--arg kind "$input_kind" \
+		--arg name "$input_name" \
+		--arg sha256 "$hash" \
+		--argjson order "$patch_count" \
+		'{order: $order, kind: $kind, name: $name, sha256: $sha256}' \
+		>> "$patch_jsonl"; then
+		die 3 "cannot record patch provenance"
+	fi
+
+	patch_snapshots+=("$snapshot_path")
+	patch_labels+=("$manifest_name")
+}
+
+declare -a patch_snapshots=()
+declare -a patch_labels=()
+
+current_stage=patch-inputs
+shopt -s nullglob
+if [[ -n $patch_dir ]]; then
+	patch_files=("$patch_dir"/*.patch)
+	((${#patch_files[@]} > 0)) ||
+		die 2 "patch directory contains no top-level *.patch files: $patch_dir"
+	patch_index=0
+	for patch_file in "${patch_files[@]}"; do
+		[[ -f $patch_file && -r $patch_file ]] ||
+			die 2 "patch is not a readable regular file: $patch_file"
+		((patch_index += 1))
+		printf -v snapshot_name 'patch-%06d.patch' "$patch_index"
+		patch_name=${patch_file##*/}
+		snapshot_patch patch "$patch_file" "$patch_name" "$snapshot_name" \
+			"patch-dir/$patch_name"
+	done
+fi
+
+if [[ -n $mbox ]]; then
+	mbox_name=${mbox##*/}
+	snapshot_patch mbox "$mbox" "$mbox_name" series.mbox "mbox/$mbox_name"
+fi
+
+if ! source_hash_line=$(printf '%s' "$source_url" | "$sha256_bin"); then
+	die 3 "cannot hash source URL"
+fi
+source_url_hash=${source_hash_line%% *}
+[[ $source_url_hash =~ ^[0-9a-f]{64}$ ]] ||
+	die 3 "unexpected SHA-256 output for source URL"
+
+readonly mirror_root=$cache_dir/kernel-git
+readonly mirror_dir=$mirror_root/$source_url_hash.git
+readonly mirror_lock=$mirror_root/$source_url_hash.lock
+make_directory "$mirror_root"
+
+cache_lock_held=0
+if ((offline)); then
+	current_stage='offline-cache'
+	[[ -d $mirror_dir ]] ||
+		die 4 "offline source cache is missing: $mirror_dir"
+	mirror_was_created=0
+else
+	current_stage=cache-lock
+	if ! exec {cache_lock_fd}> "$mirror_lock"; then
+		die 3 "cannot open cache lock: $mirror_lock"
+	fi
+	if ! "$flock_bin" -x "$cache_lock_fd"; then
+		die 3 "cannot lock source cache: $mirror_lock"
+	fi
+	cache_lock_held=1
+
+	current_stage=cache-update
+	if [[ ! -e $mirror_dir ]]; then
+		mirror_init_dir=$mirror_root/.$source_url_hash.init.$BASHPID.git
+		log "cloning persistent bare mirror cache from $display_source_url"
+		if ! run_logged git_safe clone --mirror --no-local \
+			--template="$empty_template_dir" -- "$source_url" "$mirror_init_dir"; then
+			die 4 "cannot clone bare source cache"
+		fi
+		if ! run_logged git_safe --git-dir="$mirror_init_dir" config \
+			--remove-section remote.origin; then
+			die 4 "cannot sanitize new source cache configuration"
+		fi
+		if ! "$mv_bin" -- "$mirror_init_dir" "$mirror_dir"; then
+			die 4 "cannot publish new source cache: $mirror_dir"
+		fi
+		mirror_was_created=1
+	else
+		mirror_was_created=0
+	fi
+fi
+
+if ! mirror_is_bare=$(git_safe --git-dir="$mirror_dir" \
+	rev-parse --is-bare-repository 2>> "$build_log"); then
+	die 4 "source cache is not a Git repository: $mirror_dir"
+fi
+[[ $mirror_is_bare == true ]] ||
+	die 4 "source cache is not bare: $mirror_dir"
+
+if ! source_object_format=$(git_safe --git-dir="$mirror_dir" rev-parse \
+	--show-object-format 2>> "$build_log"); then
+	die 4 "cannot identify source cache object format"
+fi
+case "$source_object_format" in
+sha1|sha256) ;;
+*) die 4 "unsupported source object format: $source_object_format" ;;
+esac
+
+if ((!offline && !mirror_was_created)); then
+	log "updating mirror from $display_source_url"
+	if ! run_logged git_safe --git-dir="$mirror_dir" fetch \
+		--prune --force --no-auto-maintenance --no-recurse-submodules \
+		-- "$source_url" '+refs/*:refs/*'; then
+		die 4 "cannot update source mirror"
+	fi
+fi
+
+current_stage=source-resolution
+if [[ $revision =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]; then
+	if ((offline)); then
+		resolution_expression="${revision}^{commit}"
+	else
+		log "verifying exact commit against the declared source"
+		verification_repo=$work_dir/exact-source-verification.git
+		if ! run_logged git_safe init --bare \
+			"--object-format=$source_object_format" \
+			--template="$empty_template_dir" "$verification_repo"; then
+			die 4 "cannot initialize exact-commit verification repository"
+		fi
+		if ! run_logged git_safe --git-dir="$verification_repo" fetch \
+			--force --no-auto-maintenance --no-recurse-submodules \
+			-- "$source_url" "$revision"; then
+			die 4 "declared source did not provide exact commit: $revision"
+		fi
+		if ! verified_exact_commit=$(git_safe --git-dir="$verification_repo" \
+			rev-parse --verify 'FETCH_HEAD^{commit}' 2>> "$build_log"); then
+			die 4 "cannot resolve exact commit supplied by declared source"
+		fi
+		if [[ ${verified_exact_commit,,} != "${revision,,}" ]]; then
+			die 4 "declared source returned a different exact commit"
+		fi
+		if ! run_logged git_safe --git-dir="$mirror_dir" fetch \
+			--force --no-auto-maintenance --no-recurse-submodules \
+			-- "$verification_repo" "$verified_exact_commit"; then
+			die 4 "cannot admit verified exact commit to source cache"
+		fi
+		resolution_expression="${verified_exact_commit}^{commit}"
+	fi
+else
+	((!offline)) || die 4 "offline resolution requires an exact commit"
+	if [[ $revision == refs/* ]]; then
+		if ! git_safe check-ref-format "$revision" >/dev/null 2>&1; then
+			die 2 "invalid full Git ref: $revision"
+		fi
+		resolved_ref=$revision
+	else
+		if ! git_safe check-ref-format "refs/heads/$revision" \
+			>/dev/null 2>&1; then
+			die 2 "invalid branch or tag name: $revision"
+		fi
+		head_ref=refs/heads/$revision
+		tag_ref=refs/tags/$revision
+		head_exists=0
+		tag_exists=0
+		if git_safe --git-dir="$mirror_dir" show-ref --verify --quiet \
+			"$head_ref"; then
+			head_exists=1
+		fi
+		if git_safe --git-dir="$mirror_dir" show-ref --verify --quiet \
+			"$tag_ref"; then
+			tag_exists=1
+		fi
+		if ((head_exists && tag_exists)); then
+			die 4 "ambiguous revision '$revision'; use refs/heads/... or refs/tags/..."
+		elif ((head_exists)); then
+			resolved_ref=$head_ref
+		elif ((tag_exists)); then
+			resolved_ref=$tag_ref
+		else
+			die 4 "branch or tag not found after mirror update: $revision"
+		fi
+	fi
+	if ! git_safe --git-dir="$mirror_dir" show-ref --verify --quiet \
+		"$resolved_ref"; then
+		die 4 "ref not found after mirror update: $resolved_ref"
+	fi
+	resolution_expression="${resolved_ref}^{commit}"
+fi
+
+if ! source_commit=$(git_safe --git-dir="$mirror_dir" rev-parse --verify \
+	"$resolution_expression" 2>> "$build_log"); then
+	die 4 "cannot resolve commit from: $revision"
+fi
+case "$source_object_format" in
+sha1)
+	[[ $source_commit =~ ^[0-9a-f]{40}$ ]] ||
+		die 4 "resolved source commit is not a SHA-1 object ID: $source_commit"
+	;;
+sha256)
+	[[ $source_commit =~ ^[0-9a-f]{64}$ ]] ||
+		die 4 "resolved source commit is not a SHA-256 object ID: $source_commit"
+	;;
+esac
+log "resolved $revision once to $source_commit"
+
+if ((resolve_only)); then
+	current_stage=resolved
+	outcome=resolved
+	printf '%s\n' "$source_commit" > "$output_dir/resolved-commit" ||
+		die 7 "cannot write resolved commit"
+	write_source_metadata "$outcome" ||
+		die 7 "cannot write resolved source provenance"
+	if ((cache_lock_held)); then
+		"$flock_bin" -u "$cache_lock_fd" ||
+			die 3 "cannot release source cache lock"
+	fi
+	log "source resolution complete: $source_commit"
+	exit 0
+fi
+
+current_stage=source-checkout
+log "creating fresh isolated source checkout"
+if ! run_logged git_safe -C "$source_dir" init \
+	"--object-format=$source_object_format" --template="$empty_template_dir"; then
+	die 4 "cannot initialize isolated source checkout"
+fi
+if ! printf '%s\n' "$mirror_dir/objects" \
+	> "$source_dir/.git/objects/info/alternates"; then
+	die 4 "cannot connect isolated checkout to the object cache"
+fi
+if ! run_logged git_safe -C "$source_dir" update-ref \
+	refs/tipboot/source "$source_commit"; then
+	die 4 "cannot anchor resolved commit in isolated checkout"
+fi
+if ! run_logged git_safe -C "$source_dir" checkout --detach --force \
+	"$source_commit"; then
+	die 4 "cannot check out resolved source commit"
+fi
+
+write_source_metadata "$outcome" ||
+	die 7 "cannot write initial source provenance"
+
+apply_mailbox()
+{
+	local mailbox_path=$1
+	local mailbox_label=$2
+
+	current_stage=patch-application
+	log "applying $mailbox_label with git am --3way"
+	if ! run_logged git_safe -C "$source_dir" \
+		-c user.name='Tipboot Kernel Builder' \
+		-c user.email=tipboot@localhost \
+		-c commit.gpgSign=false \
+		am --3way --committer-date-is-author-date -- "$mailbox_path"; then
+		die 5 "git am failed for $mailbox_label"
+	fi
+}
+
+for patch_array_index in "${!patch_snapshots[@]}"; do
+	apply_mailbox "${patch_snapshots[$patch_array_index]}" \
+		"${patch_labels[$patch_array_index]}"
+done
+
+current_stage=patched-source
+if ! patched_head=$(git_safe -C "$source_dir" rev-parse --verify HEAD \
+	2>> "$build_log"); then
+	die 5 "cannot record patched HEAD"
+fi
+if ! patched_tree=$(git_safe -C "$source_dir" rev-parse --verify 'HEAD^{tree}' \
+	2>> "$build_log"); then
+	die 5 "cannot record patched tree"
+fi
+if ! git_safe -C "$source_dir" diff-index --quiet HEAD --; then
+	die 5 "patched source is unexpectedly dirty"
+fi
+log "patched HEAD $patched_head"
+log "patched tree $patched_tree"
+if ((cache_lock_held)); then
+	if ! "$flock_bin" -u "$cache_lock_fd"; then
+		die 3 "cannot release source cache lock"
+	fi
+fi
+write_source_metadata "$outcome" ||
+	die 7 "cannot write patched source provenance"
+
+current_stage=defconfig
+log "running make ARCH=arm64 LLVM=1 defconfig with O=$build_dir"
+if ! run_logged "$make_bin" -C "$source_dir" O="$build_dir" \
+	ARCH=arm64 LLVM=1 defconfig; then
+	die 6 "arm64 LLVM defconfig failed"
+fi
+
+current_stage=image-build
+log "running out-of-tree make ARCH=arm64 LLVM=1 -j$jobs Image"
+if ! run_logged "$make_bin" -C "$source_dir" O="$build_dir" \
+	ARCH=arm64 LLVM=1 -j"$jobs" Image; then
+	die 6 "arm64 LLVM Image build failed"
+fi
+
+current_stage=kernelrelease
+kernelrelease_capture=$work_dir/kernelrelease.out
+kernelrelease_stderr=$work_dir/kernelrelease.err
+if ! run_capture_stderr_logged "$kernelrelease_capture" "$kernelrelease_stderr" \
+	"$make_bin" -s --no-print-directory -C "$source_dir" O="$build_dir" \
+	ARCH=arm64 LLVM=1 kernelrelease; then
+	die 6 "make kernelrelease failed"
+fi
+kernel_release=$(<"$kernelrelease_capture")
+[[ -n $kernel_release && $kernel_release != *$'\n'* &&
+	$kernel_release != *$'\r'* ]] ||
+	die 6 "make kernelrelease did not return exactly one non-empty line"
+
+current_stage=artifact-capture
+[[ -s $build_dir/.config ]] ||
+	die 7 "generated configuration is missing or empty: $build_dir/.config"
+image_path=$build_dir/arch/arm64/boot/Image
+[[ -s $image_path ]] ||
+	die 7 "kernel Image is missing or empty: $image_path"
+
+if ! "$cp_bin" -- "$build_dir/.config" "$output_dir/.config"; then
+	die 7 "cannot copy generated .config"
+fi
+if ! "$cp_bin" -- "$build_dir/.config" "$output_dir/config"; then
+	die 7 "cannot copy generated config compatibility artifact"
+fi
+if ! "$cp_bin" -- "$image_path" "$output_dir/Image"; then
+	die 7 "cannot copy kernel Image"
+fi
+if ! printf '%s\n' "$kernel_release" > "$output_dir/kernelrelease"; then
+	die 7 "cannot write kernelrelease"
+fi
+
+if ((keep_source)); then
+	current_stage=source-copy
+	log "copying final tracked source tree to $output_dir/source"
+	make_directory "$output_dir/source"
+	if ! run_logged git_safe -C "$source_dir" checkout-index --all --force \
+		"--prefix=$output_dir/source/"; then
+		die 7 "cannot copy final tracked source tree"
+	fi
+fi
+
+current_stage=complete
+outcome=complete
+write_source_metadata "$outcome" ||
+	die 7 "cannot write final source provenance"
+log "kernel build complete: $output_dir/Image ($kernel_release)"

@@ -1,0 +1,192 @@
+name: Upstream smoke
+
+on:
+  schedule:
+    - cron: "23 04 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-smoke
+  cancel-in-progress: false
+
+env:
+  IMAGE_REF: localhost/tipboot:upstream-smoke
+  LINUX_REPO: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+
+jobs:
+  linus-tip:
+    name: Resolve and smoke Linus tip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve Linus master
+        id: linux
+        run: |
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP}/tipboot-upstream-logs"
+          mkdir -p "${log_dir}"
+
+          resolved="$(
+            git ls-remote "${LINUX_REPO}" refs/heads/master \
+              | awk 'NR == 1 { print $1 }'
+          )"
+          if [[ ! "${resolved}" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '::error::Unable to resolve Linus master to one commit.\n'
+            exit 1
+          fi
+
+          {
+            printf 'source_url=%s\n' "${LINUX_REPO}"
+            printf 'requested_ref=refs/heads/master\n'
+            printf 'resolved_commit=%s\n' "${resolved}"
+            printf 'resolved_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee "${log_dir}/resolved-linux-tip.txt"
+          printf 'commit=%s\n' "${resolved}" >> "${GITHUB_OUTPUT}"
+
+          {
+            printf '### Linus tip resolution\n\n'
+            printf -- '- Repository: `%s`\n' "${LINUX_REPO}"
+            printf -- '- Ref: `refs/heads/master`\n'
+            printf -- '- Commit: `%s`\n' "${resolved}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Build local tool image
+        env:
+          CONTAINER_ENGINE: docker
+          REVISION: ${{ github.sha }}
+          VERSION: upstream-smoke
+        run: |
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP}/tipboot-upstream-logs"
+          make image 2>&1 | tee "${log_dir}/image-build.log"
+
+      - name: Smoke current Linus tip
+        env:
+          LINUX_COMMIT: ${{ steps.linux.outputs.commit }}
+        run: |
+          set -euo pipefail
+          result_dir="${RUNNER_TEMP}/tipboot-upstream-result"
+          cache_dir="${RUNNER_TEMP}/tipboot-upstream-cache"
+          work_dir="${RUNNER_TEMP}/tipboot-upstream-work"
+          resolution_dir="${RUNNER_TEMP}/tipboot-upstream-resolution"
+          log_dir="${RUNNER_TEMP}/tipboot-upstream-logs"
+          install -d -m 0777 \
+            "${result_dir}" "${cache_dir}" "${work_dir}" "${resolution_dir}"
+
+          docker run --rm \
+            --pull=never \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --pids-limit=512 \
+            --tmpfs=/tmp:rw,nosuid,nodev,size=1g \
+            --tmpfs=/run:rw,nosuid,nodev,size=16m \
+            --volume="${cache_dir}:/cache" \
+            --volume="${resolution_dir}:/resolve" \
+            "${IMAGE_REF}" \
+            /usr/local/libexec/tipboot/build-kernel \
+              --source-url "${LINUX_REPO}" \
+              --commit "${LINUX_COMMIT}" \
+              --work /resolve/work \
+              --output /resolve/output \
+              --cache /cache \
+              --resolve-only
+          resolved_commit="$(<"${resolution_dir}/output/resolved-commit")"
+          [[ "${resolved_commit}" == "${LINUX_COMMIT}" ]]
+
+          docker run --rm \
+            --pull=never \
+            --network=none \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --pids-limit=4096 \
+            --tmpfs=/tmp:rw,nosuid,nodev,size=16g \
+            --tmpfs=/run:rw,nosuid,nodev,size=16m \
+            --tmpfs=/home/tipboot:rw,nosuid,nodev,size=64m,mode=0700,uid=1000,gid=1000 \
+            --volume="${result_dir}:/output" \
+            --volume="${cache_dir}:/cache:ro" \
+            --volume="${work_dir}:/work" \
+            --env=TIPBOOT_IMAGE_REF="${IMAGE_REF}" \
+            "${IMAGE_REF}" \
+            /usr/local/libexec/tipboot/run-tipboot \
+              --source-url "${LINUX_REPO}" \
+              --commit "${resolved_commit}" \
+              --output /output \
+              --cache /cache \
+              --work-root /work \
+              --offline-source \
+              --jobs 2 \
+              --timeout 600 \
+            2>&1 | tee "${log_dir}/upstream-smoke.log"
+
+          for file in \
+            .config \
+            Image \
+            boot.log \
+            build.log \
+            initramfs.cpio.gz \
+            kernelrelease \
+            result.json \
+            source.json
+          do
+            test -s "${result_dir}/${file}"
+          done
+
+          jq -e '.status == "passed"' "${result_dir}/result.json" >/dev/null
+          jq -e --arg commit "${LINUX_COMMIT}" \
+            '
+              .state == "complete"
+              and .commit == $commit
+              and .patched_head == $commit
+              and (.tree | strings | length >= 40)
+            ' \
+            "${result_dir}/source.json" >/dev/null
+
+      - name: Collect logs only
+        if: always()
+        run: |
+          set -euo pipefail
+          result_dir="${RUNNER_TEMP}/tipboot-upstream-result"
+          log_dir="${RUNNER_TEMP}/tipboot-upstream-logs"
+          mkdir -p "${log_dir}"
+          for file in \
+            boot.log \
+            build.log \
+            kernelrelease \
+            patches.sha256 \
+            provenance.json \
+            result.json \
+            source.json \
+            source.txt \
+            summary.txt
+          do
+            if [[ -f "${result_dir}/${file}" ]]; then
+              cp "${result_dir}/${file}" "${log_dir}/${file}"
+            fi
+          done
+
+          if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+            printf '::error::Upstream smoke wrote files into the repository checkout.\n'
+            git status --short --untracked-files=all
+            exit 1
+          fi
+
+      - name: Upload upstream logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-smoke-logs-${{ steps.linux.outputs.commit }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/tipboot-upstream-logs/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 9

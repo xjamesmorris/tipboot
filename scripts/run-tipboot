@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage()
+{
+	cat <<'EOF'
+Usage: run-tipboot --output DIR --cache DIR [options]
+
+Internal in-container orchestrator. Use scripts/tipboot from the host.
+
+Options:
+  --source-url URL
+  --commit REF
+  --patch-dir DIR
+  --mbox FILE
+  --output DIR
+  --cache DIR
+  --work-root DIR
+  --offline-source
+  --jobs N
+  --timeout SECONDS
+  --keep-source
+  -h, --help
+EOF
+}
+
+die()
+{
+	printf 'run-tipboot: %s\n' "$*" >&2
+	exit 2
+}
+
+write_failure()
+{
+	local stage=$1
+	local exit_code=$2
+	write_provenance
+	if [[ ! -s $output/result.json ]]; then
+		jq -n \
+			--arg status failed \
+			--arg stage "$stage" \
+			--argjson exit_code "$exit_code" \
+			'{status: $status, stage: $stage, exit_code: $exit_code}' \
+			> "$output/result.json"
+	fi
+	if [[ ! -s $output/summary.txt ]]; then
+		printf 'FAIL: %s stage exited with status %d\n' \
+			"$stage" "$exit_code" > "$output/summary.txt"
+	fi
+}
+
+write_provenance()
+{
+	local provenance_tmp=$output/.provenance.json.tmp
+
+	if [[ -s $output/source.json ]]; then
+		jq -n \
+			--arg image_ref "${TIPBOOT_IMAGE_REF:-unknown}" \
+			--arg image_id "${TIPBOOT_IMAGE_ID:-unknown}" \
+			--arg image_digest "${TIPBOOT_IMAGE_DIGEST:-}" \
+			--arg run_utc "$run_utc" \
+			--slurpfile source "$output/source.json" \
+			'{image_ref: $image_ref, image_id: $image_id,
+			  image_digest: (if ($image_digest | length) > 0
+			    then $image_digest else null end),
+			  run_utc: $run_utc, source: $source[0]}' \
+			> "$provenance_tmp"
+	else
+		jq -n \
+			--arg image_ref "${TIPBOOT_IMAGE_REF:-unknown}" \
+			--arg image_id "${TIPBOOT_IMAGE_ID:-unknown}" \
+			--arg image_digest "${TIPBOOT_IMAGE_DIGEST:-}" \
+			--arg run_utc "$run_utc" \
+			'{image_ref: $image_ref, image_id: $image_id,
+			  image_digest: (if ($image_digest | length) > 0
+			    then $image_digest else null end),
+			  run_utc: $run_utc, source: null}' \
+			> "$provenance_tmp"
+	fi
+	mv -f -- "$provenance_tmp" "$output/provenance.json"
+}
+
+source_url=https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+commit=master
+patch_dir=
+mbox=
+output=
+cache=
+work_root=/tmp
+jobs=1
+timeout_seconds=180
+keep_source=0
+libexec=${TIPBOOT_LIBEXEC:-/usr/local/libexec/tipboot}
+offline_source=0
+
+while (($#)); do
+	case "$1" in
+	--source-url) source_url=${2:?}; shift 2 ;;
+	--commit) commit=${2:?}; shift 2 ;;
+	--patch-dir) patch_dir=${2:?}; shift 2 ;;
+	--mbox) mbox=${2:?}; shift 2 ;;
+	--output) output=${2:?}; shift 2 ;;
+	--cache) cache=${2:?}; shift 2 ;;
+	--work-root) work_root=${2:?}; shift 2 ;;
+	--offline-source) offline_source=1; shift ;;
+	--jobs) jobs=${2:?}; shift 2 ;;
+	--timeout) timeout_seconds=${2:?}; shift 2 ;;
+	--keep-source) keep_source=1; shift ;;
+	-h|--help) usage; exit 0 ;;
+	*) die "unknown option: $1" ;;
+	esac
+done
+
+[[ -n $output ]] || die "--output is required"
+[[ -n $cache ]] || die "--cache is required"
+mkdir -p "$output" "$cache" "$work_root"
+run_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+work=$(mktemp -d "$work_root/tipboot.XXXXXXXX")
+cleanup()
+{
+	rm -rf -- "$work"
+}
+trap cleanup EXIT
+
+build_args=(
+	--source-url "$source_url"
+	--commit "$commit"
+	--work "$work/kernel"
+	--output "$output"
+	--cache "$cache"
+	--jobs "$jobs"
+)
+[[ -z $patch_dir ]] || build_args+=(--patch-dir "$patch_dir")
+[[ -z $mbox ]] || build_args+=(--mbox "$mbox")
+((!keep_source)) || build_args+=(--keep-source)
+((!offline_source)) || build_args+=(--offline)
+
+if "$libexec/build-kernel" "${build_args[@]}"; then
+	:
+else
+	status=$?
+	write_failure build "$status"
+	exit "$status"
+fi
+
+if "$libexec/build-initramfs" \
+	--kernel-release "$(cat "$output/kernelrelease")" \
+	--output "$output/initramfs.cpio.gz" \
+	--work "$work/initramfs"; then
+	:
+else
+	status=$?
+	write_failure initramfs "$status"
+	exit "$status"
+fi
+
+if "$libexec/boot-smoke" \
+	--image "$output/Image" \
+	--initramfs "$output/initramfs.cpio.gz" \
+	--kernel-release "$(cat "$output/kernelrelease")" \
+	--output "$output" \
+	--timeout "$timeout_seconds"; then
+	:
+else
+	status=$?
+	write_failure boot "$status"
+	exit "$status"
+fi
+
+write_provenance

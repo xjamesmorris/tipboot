@@ -1,0 +1,8 @@
+**
+!Containerfile
+!scripts/
+!scripts/**
+!smoke-init/
+!smoke-init/**
+scripts/**/__pycache__/
+scripts/**/*.py[cod]

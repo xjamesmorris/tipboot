@@ -1,0 +1,21 @@
+name: Publish rolling main image
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  publish-main:
+    name: Publish rolling main
+    if: github.repository == 'xjamesmorris/tipboot'
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      channel: main

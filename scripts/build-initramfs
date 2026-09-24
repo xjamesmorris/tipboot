@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+export LC_ALL=C
+
+usage() {
+    cat <<'EOF'
+Usage:
+  scripts/build-initramfs --kernel-release RELEASE --output FILE [options]
+  scripts/build-initramfs RELEASE FILE
+
+Build a deterministic newc initramfs containing a tiny freestanding AArch64
+/init and /dev/console. Outputs ending in .gz use a deterministic gzip wrapper.
+
+Options:
+  --kernel-release RELEASE  Release embedded in the TIPBOOT_OK marker.
+  --output FILE             Output initramfs path.
+  --work DIR                Directory for temporary build files.
+  --clang PATH              Clang executable (default: $CLANG or clang).
+  --python PATH             Python 3 executable (default: $PYTHON or python3).
+  -h, --help                Show this help.
+EOF
+}
+
+usage_error() {
+    printf 'build-initramfs: error: %s\n' "$1" >&2
+    usage >&2
+    exit 2
+}
+
+script_dir=$(
+    CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
+    pwd -P
+)
+repo_root=$(
+    CDPATH='' cd -- "$script_dir/.." >/dev/null 2>&1
+    pwd -P
+)
+
+source_file="$repo_root/smoke-init/init.c"
+linker_file="$repo_root/smoke-init/linker.ld"
+newc_helper="$script_dir/lib/boot-newc.py"
+
+kernel_release=''
+output=''
+work_dir=''
+clang_bin=${CLANG:-clang}
+python_bin=${PYTHON:-python3}
+positionals=()
+
+while (($# > 0)); do
+    case "$1" in
+        --kernel-release|--release)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            kernel_release=$2
+            shift 2
+            ;;
+        --kernel-release=*|--release=*)
+            kernel_release=${1#*=}
+            shift
+            ;;
+        --output|-o)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            output=$2
+            shift 2
+            ;;
+        --output=*)
+            output=${1#*=}
+            shift
+            ;;
+        --work)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            work_dir=$2
+            shift 2
+            ;;
+        --work=*)
+            work_dir=${1#*=}
+            shift
+            ;;
+        --clang)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            clang_bin=$2
+            shift 2
+            ;;
+        --clang=*)
+            clang_bin=${1#*=}
+            shift
+            ;;
+        --python)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            python_bin=$2
+            shift 2
+            ;;
+        --python=*)
+            python_bin=${1#*=}
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            while (($# > 0)); do
+                positionals+=("$1")
+                shift
+            done
+            ;;
+        -*)
+            usage_error "unknown option: $1"
+            ;;
+        *)
+            positionals+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if ((${#positionals[@]} > 0)); then
+    ((${#positionals[@]} == 2)) ||
+        usage_error "positional form requires RELEASE and FILE"
+    [[ -z "$kernel_release" && -z "$output" ]] ||
+        usage_error "do not mix positional arguments with release/output options"
+    kernel_release=${positionals[0]}
+    output=${positionals[1]}
+fi
+
+[[ -n "$kernel_release" ]] || usage_error "--kernel-release is required"
+[[ -n "$output" ]] || usage_error "--output is required"
+[[ "$output" != "-" ]] || usage_error "binary output to stdout is not supported"
+
+if [[ ! "$kernel_release" =~ ^[A-Za-z0-9][A-Za-z0-9._+~-]{0,127}$ ]]; then
+    usage_error \
+        "kernel release must use 1-128 safe ASCII release characters"
+fi
+
+[[ -f "$source_file" ]] ||
+    usage_error "missing init source: $source_file"
+[[ -f "$linker_file" ]] ||
+    usage_error "missing linker script: $linker_file"
+[[ -f "$newc_helper" ]] ||
+    usage_error "missing archive helper: $newc_helper"
+
+command -v "$clang_bin" >/dev/null 2>&1 ||
+    usage_error "clang executable not found: $clang_bin"
+command -v "$python_bin" >/dev/null 2>&1 ||
+    usage_error "Python 3 executable not found: $python_bin"
+
+output_dir=$(dirname -- "$output")
+mkdir -p -- "$output_dir"
+[[ -d "$output_dir" ]] ||
+    usage_error "output directory is not a directory: $output_dir"
+
+if [[ -n "$work_dir" ]]; then
+    mkdir -p -- "$work_dir"
+    [[ -d "$work_dir" && -w "$work_dir" ]] ||
+        usage_error "work path is not a writable directory: $work_dir"
+    temporary_dir=$(mktemp -d "$work_dir/tipboot-initramfs.XXXXXXXX")
+else
+    temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/tipboot-initramfs.XXXXXXXX")
+fi
+init_binary="$temporary_dir/init"
+
+cleanup() {
+    rm -f -- "$init_binary"
+    rmdir -- "$temporary_dir" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+"$clang_bin" \
+    --target=aarch64-linux-gnu \
+    -fuse-ld=lld \
+    -std=c11 \
+    -Oz \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -ffreestanding \
+    -fno-builtin \
+    -fno-ident \
+    -fno-stack-protector \
+    -fno-pic \
+    -fno-pie \
+    -fno-unwind-tables \
+    -fno-asynchronous-unwind-tables \
+    -fdata-sections \
+    -ffunction-sections \
+    -nostdlib \
+    -static \
+    "-DTIPBOOT_KERNEL_RELEASE=\"${kernel_release}\"" \
+    "$source_file" \
+    -Wl,-T,"$linker_file" \
+    -Wl,--build-id=none \
+    -Wl,--gc-sections \
+    -Wl,--fatal-warnings \
+    -Wl,-no-pie \
+    -Wl,-z,max-page-size=4096 \
+    -Wl,-z,noexecstack \
+    -o "$init_binary"
+
+chmod 0755 "$init_binary"
+
+create_arguments=(
+    "$python_bin"
+    "$newc_helper"
+    create
+    --init "$init_binary"
+    --output "$output"
+    --kernel-release "$kernel_release"
+)
+if [[ "$output" == *.gz ]]; then
+    create_arguments+=(--gzip)
+fi
+"${create_arguments[@]}"
+
+"$python_bin" "$newc_helper" verify \
+    --archive "$output" \
+    --kernel-release "$kernel_release"

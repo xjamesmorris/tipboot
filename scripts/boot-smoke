@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+export LC_ALL=C
+
+usage() {
+    cat <<'EOF'
+Usage:
+  scripts/boot-smoke --kernel-image IMAGE --initramfs ARCHIVE \
+      --kernel-release RELEASE --output-dir DIR [options]
+  scripts/boot-smoke IMAGE ARCHIVE RELEASE DIR
+
+Boot an arm64 Linux Image with the Tipboot initramfs under
+qemu-system-aarch64. The guest is serial-only, has no networking, and must
+emit exactly one expected TIPBOOT_OK marker before a clean poweroff.
+
+Options:
+  --kernel-image, --image FILE  Arm64 Linux Image.
+  --initramfs FILE              Initramfs archive.
+  --kernel-release RELEASE      Release embedded in the expected marker.
+  --output-dir, --output DIR    Writes boot.log, result.json, and summary.txt.
+  --timeout SECONDS             Hard boot timeout (default: 60).
+  --qemu PATH                   qemu-system-aarch64 executable.
+  --python PATH                 Python 3 executable.
+  --timeout-command PATH        GNU timeout executable.
+  --host-arch ARCH              Override uname -m for controlled CI testing.
+  -h, --help                    Show this help.
+
+Acceleration:
+  x86_64 hosts always use TCG with -cpu max. arm64 hosts use KVM with
+  -cpu host only when /dev/kvm is accessible and QEMU passes capability and
+  initialization probes; otherwise the script reports an explicit TCG
+  fallback with -cpu max.
+EOF
+}
+
+usage_error() {
+    printf 'boot-smoke: error: %s\n' "$1" >&2
+    usage >&2
+    exit 2
+}
+
+script_dir=$(
+    CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
+    pwd -P
+)
+report_helper="$script_dir/lib/boot-report.py"
+
+kernel_image=''
+initramfs=''
+kernel_release=''
+output_dir=''
+timeout_seconds=60
+qemu_bin=${QEMU_SYSTEM_AARCH64:-qemu-system-aarch64}
+python_bin=${PYTHON:-python3}
+timeout_bin=${TIMEOUT:-timeout}
+host_arch_override=''
+positionals=()
+
+while (($# > 0)); do
+    case "$1" in
+        --kernel-image|--image|--kernel)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            kernel_image=$2
+            shift 2
+            ;;
+        --kernel-image=*|--image=*|--kernel=*)
+            kernel_image=${1#*=}
+            shift
+            ;;
+        --initramfs)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            initramfs=$2
+            shift 2
+            ;;
+        --initramfs=*)
+            initramfs=${1#*=}
+            shift
+            ;;
+        --kernel-release|--release)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            kernel_release=$2
+            shift 2
+            ;;
+        --kernel-release=*|--release=*)
+            kernel_release=${1#*=}
+            shift
+            ;;
+        --output-dir|--output|--results-dir)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            output_dir=$2
+            shift 2
+            ;;
+        --output-dir=*|--output=*|--results-dir=*)
+            output_dir=${1#*=}
+            shift
+            ;;
+        --timeout)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            timeout_seconds=$2
+            shift 2
+            ;;
+        --timeout=*)
+            timeout_seconds=${1#*=}
+            shift
+            ;;
+        --qemu)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            qemu_bin=$2
+            shift 2
+            ;;
+        --qemu=*)
+            qemu_bin=${1#*=}
+            shift
+            ;;
+        --python)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            python_bin=$2
+            shift 2
+            ;;
+        --python=*)
+            python_bin=${1#*=}
+            shift
+            ;;
+        --timeout-command)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            timeout_bin=$2
+            shift 2
+            ;;
+        --timeout-command=*)
+            timeout_bin=${1#*=}
+            shift
+            ;;
+        --host-arch)
+            (($# >= 2)) || usage_error "$1 requires a value"
+            host_arch_override=$2
+            shift 2
+            ;;
+        --host-arch=*)
+            host_arch_override=${1#*=}
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            while (($# > 0)); do
+                positionals+=("$1")
+                shift
+            done
+            ;;
+        -*)
+            usage_error "unknown option: $1"
+            ;;
+        *)
+            positionals+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if ((${#positionals[@]} > 0)); then
+    ((${#positionals[@]} == 4)) ||
+        usage_error "positional form requires IMAGE ARCHIVE RELEASE DIR"
+    [[ -z "$kernel_image" && -z "$initramfs" && -z "$kernel_release" &&
+        -z "$output_dir" ]] ||
+        usage_error "do not mix positional arguments with required options"
+    kernel_image=${positionals[0]}
+    initramfs=${positionals[1]}
+    kernel_release=${positionals[2]}
+    output_dir=${positionals[3]}
+fi
+
+[[ -n "$kernel_image" ]] || usage_error "--kernel-image is required"
+[[ -n "$initramfs" ]] || usage_error "--initramfs is required"
+[[ -n "$kernel_release" ]] || usage_error "--kernel-release is required"
+[[ -n "$output_dir" ]] || usage_error "--output-dir is required"
+
+if [[ ! "$kernel_release" =~ ^[A-Za-z0-9][A-Za-z0-9._+~-]{0,127}$ ]]; then
+    usage_error \
+        "kernel release must use 1-128 safe ASCII release characters"
+fi
+if [[ ! "$timeout_seconds" =~ ^[0-9]+$ ]] ||
+    ((10#$timeout_seconds < 1 || 10#$timeout_seconds > 3600)); then
+    usage_error "--timeout must be an integer from 1 through 3600"
+fi
+timeout_seconds=$((10#$timeout_seconds))
+
+mkdir -p -- "$output_dir"
+[[ -d "$output_dir" ]] ||
+    usage_error "output path is not a directory: $output_dir"
+
+boot_log="$output_dir/boot.log"
+result_file="$output_dir/result.json"
+summary_file="$output_dir/summary.txt"
+: >"$boot_log"
+rm -f -- "$result_file" "$summary_file"
+
+host_arch=''
+acceleration=''
+cpu=''
+acceleration_reason=''
+qemu_version=''
+current_stage='dependency_check'
+report_ready=0
+report_written=0
+
+write_failure_report() {
+    local stage=$1
+    local reason=$2
+
+    "$python_bin" "$report_helper" failure \
+        --result "$result_file" \
+        --summary "$summary_file" \
+        --boot-log "$boot_log" \
+        --kernel-image "$kernel_image" \
+        --initramfs "$initramfs" \
+        --kernel-release "$kernel_release" \
+        --host-arch "$host_arch" \
+        --acceleration "$acceleration" \
+        --cpu "$cpu" \
+        --acceleration-reason "$acceleration_reason" \
+        --qemu "$qemu_bin" \
+        --qemu-version "$qemu_version" \
+        --timeout-seconds "$timeout_seconds" \
+        --stage "$stage" \
+        --reason "$reason"
+}
+
+fail_stage() {
+    local stage=$1
+    local reason=$2
+
+    if write_failure_report "$stage" "$reason"; then
+        report_written=1
+    else
+        printf 'boot-smoke: failed to write result artifacts\n' >&2
+    fi
+    exit 1
+}
+
+# Invoked indirectly by the EXIT trap below.
+# shellcheck disable=SC2329
+on_exit() {
+    local status=$?
+
+    if ((status != 0 && report_ready == 1 && report_written == 0)); then
+        set +e
+        write_failure_report \
+            "$current_stage" \
+            "unexpected command failure with exit status $status"
+    fi
+}
+trap 'on_exit' EXIT
+
+command -v "$python_bin" >/dev/null 2>&1 ||
+    usage_error "Python 3 executable not found: $python_bin"
+[[ -f "$report_helper" ]] ||
+    usage_error "missing report helper: $report_helper"
+report_ready=1
+
+command -v "$qemu_bin" >/dev/null 2>&1 ||
+    fail_stage "dependency_check" "QEMU executable not found: $qemu_bin"
+command -v "$timeout_bin" >/dev/null 2>&1 ||
+    fail_stage "dependency_check" "timeout executable not found: $timeout_bin"
+
+timeout_help=$("$timeout_bin" --help 2>&1) ||
+    fail_stage "dependency_check" "unable to inspect timeout capabilities"
+if [[ "$timeout_help" != *"--foreground"* ||
+    "$timeout_help" != *"--kill-after"* ]]; then
+    fail_stage \
+        "dependency_check" \
+        "GNU timeout with --foreground and --kill-after is required"
+fi
+
+current_stage='input_validation'
+[[ -f "$kernel_image" && -r "$kernel_image" && -s "$kernel_image" ]] ||
+    fail_stage \
+        "input_validation" \
+        "kernel image is not a readable non-empty file: $kernel_image"
+[[ -f "$initramfs" && -r "$initramfs" && -s "$initramfs" ]] ||
+    fail_stage \
+        "input_validation" \
+        "initramfs is not a readable non-empty file: $initramfs"
+
+qemu_version_output=$("$qemu_bin" --version 2>&1) ||
+    fail_stage "dependency_check" "unable to execute $qemu_bin --version"
+qemu_version=${qemu_version_output%%$'\n'*}
+
+if [[ -n "$host_arch_override" ]]; then
+    host_arch=$host_arch_override
+else
+    host_arch=$(uname -m)
+fi
+
+use_tcg() {
+    acceleration='tcg'
+    cpu='max'
+    acceleration_reason=$1
+}
+
+current_stage='acceleration_probe'
+case "$host_arch" in
+    x86_64|amd64)
+        use_tcg "x86_64 hosts use the required portable TCG path"
+        ;;
+    aarch64|arm64)
+        if [[ ! -c /dev/kvm || ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            use_tcg "/dev/kvm is unavailable or inaccessible"
+        else
+            accel_help=$("$qemu_bin" -accel help 2>&1) || true
+            if [[ ! "$accel_help" =~ (^|[[:space:]])kvm($|[[:space:]]) ]]; then
+                use_tcg "QEMU does not advertise the KVM accelerator"
+            else
+                probe_input=$'{"execute":"qmp_capabilities"}\n{"execute":"quit"}\n'
+                set +e
+                "$timeout_bin" \
+                    --foreground \
+                    --signal=TERM \
+                    --kill-after=1s \
+                    5s \
+                    "$qemu_bin" \
+                    -machine virt,accel=kvm \
+                    -cpu host \
+                    -nodefaults \
+                    -no-user-config \
+                    -display none \
+                    -serial none \
+                    -monitor none \
+                    -S \
+                    -qmp stdio \
+                    <<<"$probe_input" \
+                    >/dev/null 2>&1
+                probe_status=$?
+                set -e
+
+                if ((probe_status == 0)); then
+                    acceleration='kvm'
+                    cpu='host'
+                    acceleration_reason="/dev/kvm is accessible and QEMU passed its KVM initialization probe"
+                else
+                    use_tcg \
+                        "QEMU failed the KVM initialization probe (status $probe_status)"
+                fi
+            fi
+        fi
+
+        if [[ "$acceleration" == "tcg" ]]; then
+            printf \
+                'boot-smoke: arm64 KVM unavailable (%s); falling back to TCG -cpu max\n' \
+                "$acceleration_reason" >&2
+        fi
+        ;;
+    *)
+        use_tcg "host architecture $host_arch uses the explicit TCG fallback"
+        ;;
+esac
+
+expected_marker="TIPBOOT_OK kernel_release=$kernel_release"
+kernel_command_line=(
+    "console=ttyAMA0"
+    "earlycon=pl011,0x09000000"
+    "rdinit=/init"
+    "panic=-1"
+    "loglevel=7"
+)
+kernel_append=$(IFS=' '; printf '%s' "${kernel_command_line[*]}")
+
+qemu_command=(
+    "$qemu_bin"
+    -machine virt
+    -accel "$acceleration"
+    -cpu "$cpu"
+    -smp 1
+    -m 256M
+    -nodefaults
+    -no-user-config
+    -display none
+    -serial stdio
+    -monitor none
+    -nic none
+    -action reboot=shutdown
+    -kernel "$kernel_image"
+    -initrd "$initramfs"
+    -append "$kernel_append"
+)
+
+current_stage='qemu_boot'
+set +e
+"$timeout_bin" \
+    --foreground \
+    --signal=TERM \
+    --kill-after=5s \
+    "${timeout_seconds}s" \
+    "${qemu_command[@]}" \
+    >"$boot_log" 2>&1
+qemu_status=$?
+set -e
+
+timed_out=0
+if ((qemu_status == 124 || qemu_status == 137)); then
+    timed_out=1
+fi
+
+current_stage='result_analysis'
+finalize_arguments=(
+    "$python_bin"
+    "$report_helper"
+    finalize
+    --result "$result_file"
+    --summary "$summary_file"
+    --boot-log "$boot_log"
+    --kernel-image "$kernel_image"
+    --initramfs "$initramfs"
+    --kernel-release "$kernel_release"
+    --host-arch "$host_arch"
+    --acceleration "$acceleration"
+    --cpu "$cpu"
+    --acceleration-reason "$acceleration_reason"
+    --qemu "$qemu_bin"
+    --qemu-version "$qemu_version"
+    --timeout-seconds "$timeout_seconds"
+    --marker "$expected_marker"
+    --qemu-exit-code "$qemu_status"
+)
+if ((timed_out == 1)); then
+    finalize_arguments+=(--timed-out)
+fi
+
+set +e
+"${finalize_arguments[@]}"
+final_status=$?
+set -e
+
+if [[ -s "$result_file" && -s "$summary_file" ]]; then
+    report_written=1
+fi
+
+exit "$final_status"

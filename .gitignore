@@ -1,0 +1,61 @@
+# Build, test, and cache directories
+/.cache/
+/build/
+/cache/
+/coverage/
+/dist/
+/out/
+/test-results/
+/tmp/
+/work/
+
+# Downloaded or extracted source trees
+/downloads/
+/kernel/
+/linux/
+/source/
+/sources/
+/kernel-*/
+/linux-*/
+
+# Kernel and initramfs build artifacts
+*.a
+*.bin
+*.cmd
+*.cpio
+*.cpio.*
+*.d
+*.dtb
+*.dtbo
+*.elf
+*.img
+*.itb
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+*.mod.o
+*.o
+*.uImage
+*.zst
+.config
+.config.old
+Module.symvers
+System.map
+initramfs*
+modules.order
+rootfs*
+vmlinux
+vmlinux.*
+
+# Downloaded archives and local logs
+*.tar
+*.tar.*
+*.log
+
+# Editor and operating-system files
+__pycache__/
+*.py[cod]
+*~
+*.swp
+.DS_Store

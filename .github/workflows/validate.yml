@@ -1,0 +1,401 @@
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REF: localhost/tipboot:ci
+  LINUX_REPO: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+  # Linux v6.12, matching the repository's immutable smoke-pinned target.
+  LINUX_PIN: adc218676eef25575469234709c2d87185ca223a
+
+jobs:
+  static:
+    name: Shell and static checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned static-analysis tools
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          HADOLINT_VERSION: "2.15.1"
+          HADOLINT_SHA256: c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+          YQ_VERSION: "4.53.6"
+          YQ_SHA256: c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385
+        run: |
+          set -euo pipefail
+          tool_dir="${RUNNER_TEMP}/tipboot-tools"
+          mkdir -p "${tool_dir}"
+
+          actionlint_archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            --location --retry 3 --retry-connrefused \
+            --output "${actionlint_archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${actionlint_archive}" \
+            | sha256sum --check -
+          tar -xzf "${actionlint_archive}" -C "${tool_dir}" actionlint
+
+          shellcheck_archive="${RUNNER_TEMP}/shellcheck.tar.xz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            --location --retry 3 --retry-connrefused \
+            --output "${shellcheck_archive}" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          printf '%s  %s\n' "${SHELLCHECK_SHA256}" "${shellcheck_archive}" \
+            | sha256sum --check -
+          tar -xJf "${shellcheck_archive}" -C "${RUNNER_TEMP}"
+          install -m 0755 \
+            "${RUNNER_TEMP}/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" \
+            "${tool_dir}/shellcheck"
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            --location --retry 3 --retry-connrefused \
+            --output "${tool_dir}/hadolint" \
+            "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-linux-x86_64"
+          printf '%s  %s\n' "${HADOLINT_SHA256}" "${tool_dir}/hadolint" \
+            | sha256sum --check -
+          chmod 0755 "${tool_dir}/hadolint"
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            --location --retry 3 --retry-connrefused \
+            --output "${tool_dir}/yq" \
+            "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          printf '%s  %s\n' "${YQ_SHA256}" "${tool_dir}/yq" \
+            | sha256sum --check -
+          chmod 0755 "${tool_dir}/yq"
+
+          printf '%s\n' "${tool_dir}" >> "${GITHUB_PATH}"
+
+      - name: Validate YAML and immutable action pins
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t yaml_files < <(
+            find .github -type f \
+              \( -name '*.yml' -o -name '*.yaml' \) -print0 \
+              | sort -z
+          )
+          ((${#yaml_files[@]} > 0))
+          yq eval-all 'true' "${yaml_files[@]}" >/dev/null
+          actionlint -shellcheck 'shellcheck --severity=warning' -color
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import re
+          import subprocess
+          import sys
+
+          uses_line = re.compile(
+              r"^\s*(?:-\s*)?uses:\s*([^\s#]+)\s*(?:#\s*(\S.*))?$"
+          )
+          action_ref = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+          version_comment = re.compile(r"^v[0-9]+(?:\.[0-9]+){1,2}$")
+          failures = []
+
+          for path in sorted(Path(".github/workflows").glob("*.y*ml")):
+              workflow = json.loads(
+                  subprocess.check_output(
+                      ["yq", "eval", "--output-format=json", ".", str(path)],
+                      text=True,
+                  )
+              )
+              if "permissions" not in workflow:
+                  failures.append(
+                      f"{path}: workflow must declare explicit permissions"
+                  )
+
+              events = workflow.get("on", {})
+              if isinstance(events, str):
+                  event_names = {events}
+              elif isinstance(events, list):
+                  event_names = set(events)
+              else:
+                  event_names = set(events)
+
+              permission_sets = [workflow.get("permissions", {})]
+              permission_sets.extend(
+                  job.get("permissions", {})
+                  for job in workflow.get("jobs", {}).values()
+              )
+              package_write = any(
+                  permissions == "write-all"
+                  or (
+                      isinstance(permissions, dict)
+                      and permissions.get("packages") == "write"
+                  )
+                  for permissions in permission_sets
+              )
+              if package_write and event_names & {
+                  "pull_request",
+                  "pull_request_target",
+              }:
+                  failures.append(
+                      f"{path}: pull request workflow grants packages: write"
+                  )
+
+              for line_number, line in enumerate(
+                  path.read_text(encoding="utf-8").splitlines(), 1
+              ):
+                  match = uses_line.match(line)
+                  if not match:
+                      continue
+                  reference, comment = match.groups()
+                  if reference.startswith("./"):
+                      continue
+                  if reference.startswith("docker://"):
+                      if "@sha256:" not in reference:
+                          failures.append(
+                              f"{path}:{line_number}: container action is not digest-pinned"
+                          )
+                      continue
+                  if not action_ref.fullmatch(reference):
+                      failures.append(
+                          f"{path}:{line_number}: action is not pinned to a full commit SHA"
+                      )
+                  if not comment or not version_comment.fullmatch(comment.strip()):
+                      failures.append(
+                          f"{path}:{line_number}: pinned action lacks a version comment"
+                      )
+
+          if failures:
+              print("\n".join(failures), file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Check shell, Python, and container sources
+        run: |
+          set -euo pipefail
+          make validate-files
+
+          mapfile -d '' -t shell_files < <(
+            while IFS= read -r -d '' file; do
+              if head -n 1 "${file}" \
+                | grep -Eq '^#!.*(ba|da|k)?sh([[:space:]]|$)'; then
+                printf '%s\0' "${file}"
+              fi
+            done < <(git ls-files -z)
+          )
+          ((${#shell_files[@]} > 0))
+
+          for file in "${shell_files[@]}"; do
+            if head -n 1 "${file}" | grep -q 'bash'; then
+              bash -n "${file}"
+            else
+              sh -n "${file}"
+            fi
+          done
+          shellcheck --external-sources "${shell_files[@]}"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import ast
+
+          for path in sorted(Path("scripts").rglob("*.py")):
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+          PY
+
+          hadolint Containerfile
+
+      - name: Run repository tests
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t tests < <(
+            find tests -maxdepth 1 -type f -name 'test-*.sh' -print0 | sort -z
+          )
+          ((${#tests[@]} > 0))
+          for test_script in "${tests[@]}"; do
+            "${test_script}"
+          done
+
+  container-smoke:
+    name: Container inspection and pinned smoke
+    needs: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and inspect the container
+        env:
+          CONTAINER_ENGINE: docker
+          REVISION: ${{ github.sha }}
+          VERSION: ci
+        run: |
+          set -euo pipefail
+          log_dir="${RUNNER_TEMP}/tipboot-smoke-logs"
+          mkdir -p "${log_dir}"
+
+          make validate 2>&1 | tee "${log_dir}/image-build.log"
+          docker image inspect "${IMAGE_REF}" \
+            | tee "${log_dir}/image-inspect.json"
+          docker history --no-trunc "${IMAGE_REF}" \
+            > "${log_dir}/image-history.txt"
+
+          jq -e --arg revision "${GITHUB_SHA}" '
+            length == 1
+            and .[0].Architecture == "amd64"
+            and .[0].Os == "linux"
+            and .[0].Config.User != ""
+            and .[0].Config.User != "0"
+            and .[0].Config.User != "0:0"
+            and .[0].Config.Labels["org.opencontainers.image.source"]
+              == "https://github.com/xjamesmorris/tipboot"
+            and .[0].Config.Labels["org.opencontainers.image.revision"]
+              == $revision
+          ' "${log_dir}/image-inspect.json" >/dev/null
+
+          docker run --rm --entrypoint /bin/sh "${IMAGE_REF}" -ec '
+            for helper in \
+              boot-smoke \
+              build-initramfs \
+              build-kernel \
+              run-tipboot \
+              version
+            do
+              test -x "/usr/local/libexec/tipboot/${helper}"
+            done
+          '
+
+      - name: Run deterministic end-to-end smoke
+        run: |
+          set -euo pipefail
+          result_dir="${RUNNER_TEMP}/tipboot-pinned-result"
+          cache_dir="${RUNNER_TEMP}/tipboot-pinned-cache"
+          work_dir="${RUNNER_TEMP}/tipboot-pinned-work"
+          resolution_dir="${RUNNER_TEMP}/tipboot-pinned-resolution"
+          log_dir="${RUNNER_TEMP}/tipboot-smoke-logs"
+          install -d -m 0777 \
+            "${result_dir}" "${cache_dir}" "${work_dir}" "${resolution_dir}"
+          mkdir -p "${log_dir}"
+
+          docker run --rm \
+            --pull=never \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --pids-limit=512 \
+            --tmpfs=/tmp:rw,nosuid,nodev,size=1g \
+            --tmpfs=/run:rw,nosuid,nodev,size=16m \
+            --volume="${cache_dir}:/cache" \
+            --volume="${resolution_dir}:/resolve" \
+            "${IMAGE_REF}" \
+            /usr/local/libexec/tipboot/build-kernel \
+              --source-url "${LINUX_REPO}" \
+              --commit "${LINUX_PIN}" \
+              --work /resolve/work \
+              --output /resolve/output \
+              --cache /cache \
+              --resolve-only
+          resolved_commit="$(<"${resolution_dir}/output/resolved-commit")"
+          [[ "${resolved_commit}" == "${LINUX_PIN}" ]]
+
+          docker run --rm \
+            --pull=never \
+            --network=none \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --pids-limit=4096 \
+            --tmpfs=/tmp:rw,nosuid,nodev,size=16g \
+            --tmpfs=/run:rw,nosuid,nodev,size=16m \
+            --tmpfs=/home/tipboot:rw,nosuid,nodev,size=64m,mode=0700,uid=1000,gid=1000 \
+            --volume="${result_dir}:/output" \
+            --volume="${cache_dir}:/cache:ro" \
+            --volume="${work_dir}:/work" \
+            --env=TIPBOOT_IMAGE_REF="${IMAGE_REF}" \
+            "${IMAGE_REF}" \
+            /usr/local/libexec/tipboot/run-tipboot \
+              --source-url "${LINUX_REPO}" \
+              --commit "${resolved_commit}" \
+              --output /output \
+              --cache /cache \
+              --work-root /work \
+              --offline-source \
+              --jobs 2 \
+              --timeout 600 \
+            2>&1 | tee "${log_dir}/pinned-smoke.log"
+
+          for file in \
+            .config \
+            Image \
+            boot.log \
+            build.log \
+            initramfs.cpio.gz \
+            kernelrelease \
+            result.json \
+            source.json
+          do
+            test -s "${result_dir}/${file}"
+          done
+
+          jq -e '.status == "passed"' "${result_dir}/result.json" >/dev/null
+          jq -e --arg commit "${LINUX_PIN}" \
+            '
+              .state == "complete"
+              and .commit == $commit
+              and .patched_head == $commit
+              and (.tree | strings | length >= 40)
+            ' \
+            "${result_dir}/source.json" >/dev/null
+
+          {
+            printf '### Pinned end-to-end smoke\n\n'
+            printf -- '- Linux commit: `%s`\n' "${LINUX_PIN}"
+            printf -- '- Result: passed\n'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Collect smoke logs
+        if: always()
+        run: |
+          set -euo pipefail
+          result_dir="${RUNNER_TEMP}/tipboot-pinned-result"
+          log_dir="${RUNNER_TEMP}/tipboot-smoke-logs"
+          mkdir -p "${log_dir}"
+          for file in \
+            boot.log \
+            build.log \
+            kernelrelease \
+            patches.sha256 \
+            provenance.json \
+            result.json \
+            source.json \
+            source.txt \
+            summary.txt
+          do
+            if [[ -f "${result_dir}/${file}" ]]; then
+              cp "${result_dir}/${file}" "${log_dir}/${file}"
+            fi
+          done
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pinned-smoke-logs-${{ github.run_id }}
+          path: ${{ runner.temp }}/tipboot-smoke-logs/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 9
